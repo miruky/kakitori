@@ -13,21 +13,53 @@ export interface StrokeVerdict {
 }
 
 const SAMPLES = 32;
+const MIN_DRAWN_LENGTH = 4;
 
 // しきい値はviewBox(109)に対する値。子どもの手書きを想定してやや緩めに取り、
 // 逆順(書き始めと終わりが逆)は対応点の距離が大きく出るので自然に弾かれる
-const MAX_AVG = 13;
-const MAX_ENDPOINT = 20;
-const MIN_LENGTH_RATIO = 0.45;
-const MAX_LENGTH_RATIO = 2.2;
-const MIN_DRAWN_LENGTH = 4;
-
-export function judgeStroke(drawn: readonly Point[], expectedPathD: string): StrokeVerdict {
-  const expected = pathToPolyline(expectedPathD);
-  return judgePolyline(drawn, expected);
+export interface JudgeThresholds {
+  /** 対応点どうしの平均距離の上限 */
+  maxAvg: number;
+  /** 書き始め・書き終わりの位置ずれの上限 */
+  maxEndpoint: number;
+  minLengthRatio: number;
+  maxLengthRatio: number;
 }
 
-export function judgePolyline(drawn: readonly Point[], expected: readonly Point[]): StrokeVerdict {
+export const DEFAULT_THRESHOLDS: JudgeThresholds = {
+  maxAvg: 13,
+  maxEndpoint: 20,
+  minLengthRatio: 0.45,
+  maxLengthRatio: 2.2,
+};
+
+/** 判定のきびしさ。練習する人に合わせて選べる。 */
+export type Difficulty = 'easy' | 'normal' | 'strict';
+
+const THRESHOLDS: Record<Difficulty, JudgeThresholds> = {
+  easy: { maxAvg: 18, maxEndpoint: 26, minLengthRatio: 0.35, maxLengthRatio: 2.6 },
+  normal: DEFAULT_THRESHOLDS,
+  strict: { maxAvg: 9, maxEndpoint: 14, minLengthRatio: 0.6, maxLengthRatio: 1.7 },
+};
+
+export function thresholdsFor(d: Difficulty): JudgeThresholds {
+  return THRESHOLDS[d];
+}
+
+export function judgeStroke(
+  drawn: readonly Point[],
+  expectedPathD: string,
+  thresholds: JudgeThresholds = DEFAULT_THRESHOLDS,
+): StrokeVerdict {
+  const expected = pathToPolyline(expectedPathD);
+  return judgePolyline(drawn, expected, thresholds);
+}
+
+export function judgePolyline(
+  drawn: readonly Point[],
+  expected: readonly Point[],
+  thresholds: JudgeThresholds = DEFAULT_THRESHOLDS,
+): StrokeVerdict {
   const fail = (reason: StrokeVerdict['reason']): StrokeVerdict => ({
     ok: false,
     avgDistance: Number.POSITIVE_INFINITY,
@@ -61,10 +93,11 @@ export function judgePolyline(drawn: readonly Point[], expected: readonly Point[
   const lengthRatio = expectedLength === 0 ? 0 : drawnLength / expectedLength;
 
   let reason: StrokeVerdict['reason'];
-  if (startDistance > MAX_ENDPOINT) reason = 'start';
-  else if (endDistance > MAX_ENDPOINT) reason = 'end';
-  else if (lengthRatio < MIN_LENGTH_RATIO || lengthRatio > MAX_LENGTH_RATIO) reason = 'length';
-  else if (avgDistance > MAX_AVG) reason = 'shape';
+  if (startDistance > thresholds.maxEndpoint) reason = 'start';
+  else if (endDistance > thresholds.maxEndpoint) reason = 'end';
+  else if (lengthRatio < thresholds.minLengthRatio || lengthRatio > thresholds.maxLengthRatio)
+    reason = 'length';
+  else if (avgDistance > thresholds.maxAvg) reason = 'shape';
 
   return {
     ok: reason === undefined,
