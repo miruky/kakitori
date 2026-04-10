@@ -1,19 +1,24 @@
 import './style.css';
 import {
   KANJIVG_VIEWBOX,
+  emptyMastery,
+  formatHash,
   isPassed,
   judgePolyline,
   judgeReasonLabels,
   kanjiData,
   markPassed,
+  parseHash,
   passedCount,
   pathToPolyline,
   readings,
   restoreMastery,
+  thresholdsFor,
 } from './lib';
-import type { Mastery, Mode, Point } from './lib';
+import type { Difficulty, Mastery, Mode, Point } from './lib';
 
 const STORE_KEY = 'kakitori:mastery';
+const DIFF_KEY = 'kakitori:difficulty';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const VB = KANJIVG_VIEWBOX;
 /** この回数までのミスなら合格として記録する */
@@ -52,14 +57,19 @@ app.innerHTML = `
       <div class="toolbar">
         <div class="tabs" id="mode-tabs" role="tablist" aria-label="モード"></div>
         <span class="spacer"></span>
-        <button type="button" id="btn-hint">ヒント</button>
-        <button type="button" id="btn-reset">書き直す</button>
-        <button type="button" id="btn-next" class="primary">次の字</button>
+        <div class="difficulty" id="difficulty" role="group" aria-label="判定のきびしさ"></div>
       </div>
       <div class="prompt" id="prompt" aria-live="polite"></div>
       <div class="board-wrap">
         <svg id="board" viewBox="0 0 ${VB} ${VB}" role="application"
           aria-label="ここに指やマウスで書く"></svg>
+      </div>
+      <div class="controls">
+        <button type="button" id="btn-replay">手本を再生</button>
+        <button type="button" id="btn-hint">ヒント</button>
+        <button type="button" id="btn-reset">書き直す</button>
+        <span class="spacer"></span>
+        <button type="button" id="btn-next" class="primary">次の字</button>
       </div>
       <div class="statusbar" id="status" aria-live="polite"></div>
     </section>
@@ -67,6 +77,7 @@ app.innerHTML = `
       <div class="toolbar">
         <span class="grid-title">小学1年の漢字</span>
         <span class="spacer"></span>
+        <button type="button" class="link-btn" id="btn-reset-progress">記録を消す</button>
         <span class="grid-count" id="grid-count"></span>
       </div>
       <div class="char-grid" id="char-grid"></div>
@@ -81,11 +92,30 @@ const board = mustFind<SVGSVGElement>('#board');
 const promptBox = mustFind<HTMLDivElement>('#prompt');
 const statusBar = mustFind<HTMLDivElement>('#status');
 const modeTabs = mustFind<HTMLDivElement>('#mode-tabs');
+const difficultyBar = mustFind<HTMLDivElement>('#difficulty');
 const charGrid = mustFind<HTMLDivElement>('#char-grid');
 const gridCount = mustFind<HTMLSpanElement>('#grid-count');
+const btnReplay = mustFind<HTMLButtonElement>('#btn-replay');
 const btnHint = mustFind<HTMLButtonElement>('#btn-hint');
 const btnReset = mustFind<HTMLButtonElement>('#btn-reset');
 const btnNext = mustFind<HTMLButtonElement>('#btn-next');
+const btnResetProgress = mustFind<HTMLButtonElement>('#btn-reset-progress');
+
+const DIFFICULTIES: { key: Difficulty; label: string }[] = [
+  { key: 'easy', label: 'やさしい' },
+  { key: 'normal', label: 'ふつう' },
+  { key: 'strict', label: 'きびしい' },
+];
+
+function loadDifficulty(): Difficulty {
+  try {
+    const v = localStorage.getItem(DIFF_KEY);
+    if (v === 'easy' || v === 'normal' || v === 'strict') return v;
+  } catch {
+    // 取れなければ「ふつう」
+  }
+  return 'normal';
+}
 
 let mastery: Mastery;
 try {
@@ -93,11 +123,13 @@ try {
 } catch {
   mastery = restoreMastery(null);
 }
+let difficulty: Difficulty = loadDifficulty();
 let mode: Mode = 'trace';
 let charIndex = 0;
 let strokeIndex = 0;
 let missCount = 0;
 let drawing = false;
+let replaying = false;
 let trail: Point[] = [];
 let message = '';
 
@@ -127,10 +159,37 @@ function persist(): void {
   }
 }
 
+function persistDifficulty(): void {
+  try {
+    localStorage.setItem(DIFF_KEY, difficulty);
+  } catch {
+    // 保存できなくてもきびしさは反映する
+  }
+}
+
+function prefersReduced(): boolean {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function syncHash(): void {
+  const target = formatHash(mode, current().char);
+  if (location.hash !== target) history.replaceState(null, '', target);
+}
+
 function el(name: string, attrs: Record<string, string>): SVGElement {
   const node = document.createElementNS(SVG_NS, name);
   for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
   return node;
+}
+
+// 升目の下敷きになる十字ガイド
+function appendGuide(): void {
+  const guide = el('g', { class: 'grid-lines' });
+  guide.append(
+    el('line', { x1: String(VB / 2), y1: '4', x2: String(VB / 2), y2: String(VB - 4) }),
+    el('line', { x1: '4', y1: String(VB / 2), x2: String(VB - 4), y2: String(VB / 2) }),
+  );
+  board.append(guide);
 }
 
 function trailD(points: readonly Point[]): string {
@@ -149,14 +208,7 @@ function trailD(points: readonly Point[]): string {
 function renderBoard(opts: { hint?: boolean; wrongTrail?: Point[] } = {}): void {
   const k = current();
   board.textContent = '';
-
-  // 下敷きの十字ガイド
-  const guide = el('g', { class: 'grid-lines' });
-  guide.append(
-    el('line', { x1: String(VB / 2), y1: '4', x2: String(VB / 2), y2: String(VB - 4) }),
-    el('line', { x1: '4', y1: String(VB / 2), x2: String(VB - 4), y2: String(VB / 2) }),
-  );
-  board.append(guide);
+  appendGuide();
 
   // なぞりモードは手本全体を薄く敷く
   if (mode === 'trace') {
@@ -264,6 +316,28 @@ function renderTabs(): void {
   }
 }
 
+function renderDifficulty(): void {
+  difficultyBar.textContent = '';
+  const lead = document.createElement('span');
+  lead.className = 'diff-lead kicker';
+  lead.textContent = 'きびしさ';
+  difficultyBar.append(lead);
+  for (const d of DIFFICULTIES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'diff-chip';
+    btn.setAttribute('aria-pressed', String(difficulty === d.key));
+    btn.textContent = d.label;
+    btn.addEventListener('click', () => {
+      if (difficulty === d.key) return;
+      difficulty = d.key;
+      persistDifficulty();
+      renderDifficulty();
+    });
+    difficultyBar.append(btn);
+  }
+}
+
 function renderGrid(): void {
   charGrid.textContent = '';
   kanjiData.forEach((k, idx) => {
@@ -291,6 +365,80 @@ function resetChar(): void {
   renderPrompt();
   renderBoard();
   renderStatus();
+  syncHash();
+}
+
+// 手本を一画ずつ再生する。書き終えた画は墨で残し、いま書く画を山吹で引く。
+function renderReplayFrame(doneCount: number, animateIdx: number | null): void {
+  const k = current();
+  board.textContent = '';
+  appendGuide();
+  const done = el('g', { class: 'ink' });
+  k.strokes.slice(0, doneCount).forEach((d) => done.append(el('path', { d })));
+  board.append(done);
+  if (animateIdx !== null) {
+    const d = k.strokes[animateIdx];
+    if (d !== undefined) {
+      const hint = el('path', { class: 'hint-stroke', d });
+      board.append(hint);
+      const len = Math.ceil(polylineLengthOf(k.char, animateIdx));
+      hint.setAttribute('stroke-dasharray', String(len));
+      hint.setAttribute('stroke-dashoffset', String(len));
+      hint.getBoundingClientRect();
+      hint.classList.add('animate');
+    }
+  }
+}
+
+function replayStrokes(): void {
+  if (replaying) return;
+  const k = current();
+  if (prefersReduced()) {
+    renderReplayFrame(k.strokes.length, null);
+    window.setTimeout(renderBoard, 1200);
+    return;
+  }
+  replaying = true;
+  btnReplay.disabled = true;
+  let s = 0;
+  const tick = (): void => {
+    if (s >= k.strokes.length) {
+      replaying = false;
+      btnReplay.disabled = false;
+      renderBoard();
+      return;
+    }
+    renderReplayFrame(s, s);
+    s += 1;
+    window.setTimeout(tick, 640);
+  };
+  tick();
+}
+
+function resetProgress(): void {
+  if (!window.confirm('合格の記録をすべて消す。よろしいか。')) return;
+  mastery = emptyMastery();
+  persist();
+  renderGrid();
+}
+
+function applyRouteFromHash(): void {
+  const route = parseHash(location.hash);
+  if (!route) return;
+  let changed = mode !== route.mode;
+  mode = route.mode;
+  if (route.char) {
+    const idx = kanjiData.findIndex((k) => k.char === route.char);
+    if (idx >= 0 && idx !== charIndex) {
+      charIndex = idx;
+      changed = true;
+    }
+  }
+  if (changed) {
+    renderTabs();
+    renderGrid();
+    resetChar();
+  }
 }
 
 function finishChar(): void {
@@ -317,6 +465,7 @@ function toBoardPoint(e: PointerEvent): Point {
 }
 
 board.addEventListener('pointerdown', (e) => {
+  if (replaying) return;
   const k = current();
   if (strokeIndex >= k.strokes.length) return;
   drawing = true;
@@ -343,7 +492,7 @@ board.addEventListener('pointerup', () => {
   const expected = polylinesOf(k.char)[strokeIndex];
   if (!expected) return;
 
-  const verdict = judgePolyline(trail, expected);
+  const verdict = judgePolyline(trail, expected, thresholdsFor(difficulty));
   if (verdict.ok) {
     strokeIndex += 1;
     message = '';
@@ -364,7 +513,9 @@ btnHint.addEventListener('click', () => {
   renderBoard({ hint: true });
 });
 
+btnReplay.addEventListener('click', replayStrokes);
 btnReset.addEventListener('click', resetChar);
+btnResetProgress.addEventListener('click', resetProgress);
 
 btnNext.addEventListener('click', () => {
   const start = (charIndex + 1) % kanjiData.length;
@@ -382,6 +533,19 @@ btnNext.addEventListener('click', () => {
   renderGrid();
 });
 
+window.addEventListener('hashchange', applyRouteFromHash);
+
+// 起動時にURLハッシュからモードと字を復元する
+const initialRoute = parseHash(location.hash);
+if (initialRoute) {
+  mode = initialRoute.mode;
+  if (initialRoute.char) {
+    const idx = kanjiData.findIndex((k) => k.char === initialRoute.char);
+    if (idx >= 0) charIndex = idx;
+  }
+}
+
 renderTabs();
+renderDifficulty();
 renderGrid();
 resetChar();
