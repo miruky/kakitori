@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { kanjiData } from './data/strokes';
-import { judgeStroke } from './judge';
+import { DEFAULT_THRESHOLDS, judgeStroke, thresholdsFor } from './judge';
 import { pathToPolyline } from './path';
 import type { Point } from './path';
 
@@ -60,5 +60,23 @@ describe('judgeStroke', () => {
         }
       });
     }
+  });
+});
+
+describe('判定のきびしさ', () => {
+  it('やさしいほど平均距離の許容が大きい', () => {
+    expect(thresholdsFor('easy').maxAvg).toBeGreaterThan(thresholdsFor('normal').maxAvg);
+    expect(thresholdsFor('normal').maxAvg).toBeGreaterThan(thresholdsFor('strict').maxAvg);
+    expect(thresholdsFor('normal')).toEqual(DEFAULT_THRESHOLDS);
+  });
+
+  it('境目のずれは、ふつうでは通りきびしいでは落ちる', () => {
+    const d = strokeOf('一', 0);
+    const drawn = jitter(pathToPolyline(d), 0, 11); // 平均距離およそ11
+    expect(judgeStroke(drawn, d, thresholdsFor('easy')).ok).toBe(true);
+    expect(judgeStroke(drawn, d, thresholdsFor('normal')).ok).toBe(true);
+    const strict = judgeStroke(drawn, d, thresholdsFor('strict'));
+    expect(strict.ok).toBe(false);
+    expect(strict.reason).toBe('shape');
   });
 });
